@@ -6,6 +6,7 @@ package xopen
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/dsnet/compress/bzip2"
 	"github.com/klauspost/compress/zstd"
@@ -114,6 +116,9 @@ type Reader struct {
 	*bufio.Reader
 	rdr io.Reader
 	gz  io.ReadCloser
+
+	gzReader *gzip.Reader
+	isGzip   bool
 }
 
 // Close the associated files.
@@ -130,6 +135,9 @@ func (r *Reader) Close() error {
 		if err != nil {
 			return err
 		}
+	}
+	if r.isGzip {
+		poolGzipReader.Put(r.gzReader)
 	}
 	return nil
 }
@@ -204,6 +212,12 @@ func (w *Writer) Flush() error {
 
 var bufSize = 65536
 
+var poolGzipReader = &sync.Pool{New: func() interface{} {
+	r, _ := gzip.NewReader(bytes.NewReader([]byte{31, 139, 8, 0, 0, 0,
+		0, 0, 0, 3, 227, 2, 0, 147, 6, 215, 50, 1, 0, 0, 0}))
+	return r
+}}
+
 // Buf returns a buffered reader from an io.Reader
 // If f == "-", then it will attempt to read from os.Stdin.
 // If the file is gzipped, it will be read as such.
@@ -211,6 +225,9 @@ func Buf(r io.Reader) (*Reader, error) {
 	b := bufio.NewReaderSize(r, bufSize)
 	var rd io.Reader
 	var rdr io.ReadCloser
+	var gzReader *gzip.Reader
+
+	isGzip := false
 
 	if is, err := IsGzip(b); err != nil {
 		// check BOM
@@ -221,13 +238,17 @@ func Buf(r io.Reader) (*Reader, error) {
 		if t != '\uFEFF' {
 			b.UnreadRune()
 		}
-		return &Reader{b, r, rdr}, nil // non-gzip file with content less than 2 bytes
+		return &Reader{b, r, rdr, gzReader, isGzip}, nil // non-gzip file with content less than 2 bytes
 	} else if is {
-		rdr, err = gzip.NewReader(b)
+		// rdr, err = gzip.NewReader(b)
+		rdr := poolGzipReader.Get().(*gzip.Reader)
+		err = rdr.Reset(b)
 		if err != nil {
 			return nil, err
 		}
 		b = bufio.NewReaderSize(rdr, bufSize)
+		gzReader = rdr
+		isGzip = true
 	} else if is, err := IsZst(b); err != nil {
 		// check BOM
 		t, _, err := b.ReadRune() // no content
@@ -237,7 +258,7 @@ func Buf(r io.Reader) (*Reader, error) {
 		if t != '\uFEFF' {
 			b.UnreadRune()
 		}
-		return &Reader{b, r, rdr}, nil // non-gzip/zst file with content less than 4 bytes
+		return &Reader{b, r, rdr, gzReader, isGzip}, nil // non-gzip/zst file with content less than 4 bytes
 	} else if is {
 		rd, err = zstd.NewReader(b)
 		if err != nil {
@@ -253,7 +274,7 @@ func Buf(r io.Reader) (*Reader, error) {
 		if t != '\uFEFF' {
 			b.UnreadRune()
 		}
-		return &Reader{b, r, rdr}, nil // non-gzip/zst/xz file with content less than 6 bytes
+		return &Reader{b, r, rdr, gzReader, isGzip}, nil // non-gzip/zst/xz file with content less than 6 bytes
 	} else if is {
 		rd, err = xz.NewReader(b)
 		if err != nil {
@@ -269,7 +290,7 @@ func Buf(r io.Reader) (*Reader, error) {
 		if t != '\uFEFF' {
 			b.UnreadRune()
 		}
-		return &Reader{b, r, rdr}, nil // non-gzip/zst/xz file with content less than 6 bytes
+		return &Reader{b, r, rdr, gzReader, isGzip}, nil // non-gzip/zst/xz file with content less than 6 bytes
 	} else if is {
 		rd, err = bzip2.NewReader(b, &bzip2.ReaderConfig{})
 		if err != nil {
@@ -288,7 +309,7 @@ func Buf(r io.Reader) (*Reader, error) {
 	if t != '\uFEFF' {
 		b.UnreadRune()
 	}
-	return &Reader{b, r, rdr}, nil
+	return &Reader{b, r, rdr, gzReader, isGzip}, nil
 }
 
 // XReader returns a reader from a url string or a file.
