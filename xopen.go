@@ -21,6 +21,7 @@ import (
 	"github.com/dsnet/compress/bzip2"
 	"github.com/klauspost/compress/zstd"
 	gzip "github.com/klauspost/pgzip"
+	"github.com/pierrec/lz4/v4"
 	"github.com/ulikunitz/xz"
 )
 
@@ -52,6 +53,15 @@ func IsZst(b *bufio.Reader) (bool, error) {
 // IsBzip2 returns true buffered Reader has the bzip2 magic.
 func IsBzip2(b *bufio.Reader) (bool, error) {
 	return CheckBytes(b, []byte{0x42, 0x5a, 0x68})
+}
+
+// IsBzip2 returns true buffered Reader has the bzip2 magic.
+func IsLZ4(b *bufio.Reader) (bool, error) {
+	ok, err := CheckBytes(b, []byte{0x04, 0x22, 0x4D, 0x18}) // new
+	if err != nil || ok {
+		return ok, err
+	}
+	return CheckBytes(b, []byte{0x02, 0x21, 0x4C, 0x18}) // legacy
 }
 
 // IsStdin checks if we are getting data from stdin.
@@ -150,6 +160,7 @@ type Writer struct {
 	xw  *xz.Writer
 	zw  *zstd.Encoder
 	bz2 *bzip2.Writer
+	lz  *lz4.Writer
 }
 
 // Close the associated files.
@@ -180,6 +191,12 @@ func (w *Writer) Close() error {
 	}
 	if w.bz2 != nil {
 		err = w.bz2.Close()
+		if err != nil {
+			return err
+		}
+	}
+	if w.lz != nil {
+		err = w.lz.Close()
 		if err != nil {
 			return err
 		}
@@ -297,6 +314,19 @@ func Buf(r io.Reader) (*Reader, error) {
 			return nil, err
 		}
 		b = bufio.NewReaderSize(rd, bufSize)
+	} else if is, err := IsLZ4(b); err != nil {
+		// check BOM
+		t, _, err := b.ReadRune() // no content
+		if err != nil {
+			return nil, ErrNoContent
+		}
+		if t != '\uFEFF' {
+			b.UnreadRune()
+		}
+		return &Reader{b, r, rdr, gzReader, isGzip}, nil // non-gzip/zst/xz file with content less than 6 bytes
+	} else if is {
+		rd = lz4.NewReader(b)
+		b = bufio.NewReaderSize(rd, bufSize)
 	}
 
 	// other files with content >= 6 bytes
@@ -385,6 +415,7 @@ func Ropen(f string) (*Reader, error) {
 // If f endswith ".xz", then the output will be zx-compressed.
 // If f endswith ".zst", then the output will be zstd-compressed.
 // If f endswith ".bz2", then the output will be bzip2-compressed.
+// If f endswith ".lz4", then the output will be bzip2-compressed.
 func Wopen(f string) (*Writer, error) {
 	return WopenFile(f, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 }
@@ -393,7 +424,7 @@ func Wopen(f string) (*Writer, error) {
 // If f == "-", then stdout will be used.
 // If f endswith ".gz", then the output will be gzipped.
 // If f endswith ".xz", then the output will be zx-compressed.
-// If f endswith ".bz2", then the output will be bzip2-compressed.
+// If f endswith ".lz4", then the output will be bzip2-compressed.
 func WopenFile(f string, flag int, perm os.FileMode) (*Writer, error) {
 	var wtr *os.File
 	if f == "-" {
@@ -417,13 +448,13 @@ func WopenFile(f string, flag int, perm os.FileMode) (*Writer, error) {
 	if strings.HasSuffix(f2, ".gz") {
 		gz, err := gzip.NewWriterLevel(wtr, Level)
 		if err != nil {
-			err = errors.New(fmt.Sprintf("xopen: %s", err))
+			err = fmt.Errorf("xopen: gzip: %s", err)
 		}
-		return &Writer{bufio.NewWriterSize(gz, bufSize), wtr, gz, nil, nil, nil}, err
+		return &Writer{bufio.NewWriterSize(gz, bufSize), wtr, gz, nil, nil, nil, nil}, err
 	}
 	if strings.HasSuffix(f2, ".xz") {
 		xw, err := xz.NewWriter(wtr)
-		return &Writer{bufio.NewWriterSize(xw, bufSize), wtr, nil, xw, nil, nil}, err
+		return &Writer{bufio.NewWriterSize(xw, bufSize), wtr, nil, xw, nil, nil, nil}, err
 	}
 	if strings.HasSuffix(f2, ".zst") {
 		level := Level
@@ -432,9 +463,9 @@ func WopenFile(f string, flag int, perm os.FileMode) (*Writer, error) {
 		}
 		zw, err := zstd.NewWriter(wtr, zstd.WithEncoderLevel(zstd.EncoderLevel(level)))
 		if err != nil {
-			err = errors.New(fmt.Sprintf("xopen: zstd: %s", err))
+			err = fmt.Errorf("xopen: zstd: %s", err)
 		}
-		return &Writer{bufio.NewWriterSize(zw, bufSize), wtr, nil, nil, zw, nil}, err
+		return &Writer{bufio.NewWriterSize(zw, bufSize), wtr, nil, nil, zw, nil, nil}, err
 	}
 	if strings.HasSuffix(f2, ".bz2") {
 		level := Level
@@ -443,9 +474,55 @@ func WopenFile(f string, flag int, perm os.FileMode) (*Writer, error) {
 		}
 		bz2, err := bzip2.NewWriter(wtr, &bzip2.WriterConfig{Level: level})
 		if err != nil {
-			err = errors.New(fmt.Sprintf("xopen: %s", err))
+			err = fmt.Errorf("xopen: bz2: %s", err)
 		}
-		return &Writer{bufio.NewWriterSize(bz2, bufSize), wtr, nil, nil, nil, bz2}, err
+		return &Writer{bufio.NewWriterSize(bz2, bufSize), wtr, nil, nil, nil, bz2, nil}, err
 	}
-	return &Writer{bufio.NewWriterSize(wtr, bufSize), wtr, nil, nil, nil, nil}, nil
+	if strings.HasSuffix(f2, ".lz4") {
+		level := Level
+		if level == gzip.DefaultCompression {
+			level = 5
+		}
+
+		var lvl lz4.CompressionLevel
+		switch level {
+		case 0:
+			lvl = lz4.Fast
+		case 1:
+			lvl = lz4.Level1
+		case 2:
+			lvl = lz4.Level2
+		case 3:
+			lvl = lz4.Level3
+		case 4:
+			lvl = lz4.Level4
+		case 5:
+			lvl = lz4.Level5
+		case 6:
+			lvl = lz4.Level6
+		case 7:
+			lvl = lz4.Level7
+		case 8:
+			lvl = lz4.Level8
+		case 9:
+			lvl = lz4.Level9
+		default:
+			lvl = lz4.Level9
+		}
+
+		lz := lz4.NewWriter(wtr)
+		options := []lz4.Option{
+			lz4.BlockChecksumOption(false),
+			lz4.BlockSizeOption(lz4.BlockSize(4 << 20)),
+			lz4.ChecksumOption(true),
+			lz4.CompressionLevelOption(lvl),
+			lz4.ConcurrencyOption(8),
+		}
+		var err error
+		if err = lz.Apply(options...); err != nil {
+			err = fmt.Errorf("xopen: lz4: %s", err)
+		}
+		return &Writer{bufio.NewWriterSize(lz, bufSize), wtr, nil, nil, nil, nil, lz}, err
+	}
+	return &Writer{bufio.NewWriterSize(wtr, bufSize), wtr, nil, nil, nil, nil, nil}, nil
 }

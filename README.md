@@ -6,7 +6,7 @@
 
     import "github.com/shenwei356/xopen"
 
-xopen makes it easy to get buffered (possibly `gzip`-, `xz`-, or `zstd`- compressed) readers and writers. and
+xopen makes it easy to get buffered (possibly `gzip`-, `xz`-, `zstd`-, `bzip2`-, or `lz4`- compressed) readers and writers. and
 close all of the associated files. `Ropen` opens a file for reading. `Wopen` opens a
 file for writing. 
 
