@@ -1,6 +1,4 @@
 [![GoDoc](https://godoc.org/github.com/shenwei356/xopen?status.png)](https://godoc.org/github.com/shenwei356/xopen)
-[![Build Status](https://travis-ci.org/shenwei356/xopen.svg)](https://travis-ci.org/shenwei356/xopen)
-[![Coverage Status](https://coveralls.io/repos/shenwei356/xopen/badge.svg?branch=master)](https://coveralls.io/r/shenwei356/xopen?branch=master)
 
 # xopen
 
@@ -12,6 +10,8 @@ file for writing.
 
 > This packages is forked from https://github.com/brentp/xopen ,
 > but I have modified too much :(
+
+Requires Go 1.25.5 or later. Run `go test -race ./...` to check the package.
 
 ## Usage
 
@@ -36,7 +36,7 @@ rdr, err := xopen.Ropen("| ls -lh somefile.gz")
 rdr, err := xopen.Ropen("~/shenwei356/somefile")
 
 checkError(err)
-defer checkError(rdr.Close())
+defer func() { checkError(rdr.Close()) }()
 ```
 
 `Buf` and `Ropen` return `ErrNoContent` only for an empty stream that ends
@@ -47,11 +47,29 @@ construction fails, while `Ropen` closes inputs it opened.
 Stopping early does not validate unread compressed data. Read to EOF to check
 the whole stream, then close the reader to release its resources.
 
-Writter
+Writer
 
 ```go
 wtr, err := xopen.Wopen("some.gz")
-defer checkError(wtr.Close())
+checkError(err)
+defer func() { checkError(wtr.Close()) }()
 
-outfh.Flush()
+checkError(wtr.Flush())
 ```
+
+`Close` releases resources even after a read or write error; repeated calls return
+its original result. Readers and writers must not be used concurrently or after
+`Close`. As before, closing a stream opened with `"-"` also closes stdin or stdout.
+
+Set `Level` before starting concurrent writes. Compression levels, buffer sizes,
+and default compression settings are unchanged. Invalid gzip, zstd, or bzip2
+levels are rejected before the destination is opened or truncated.
+
+`Flush` flushes gzip and zstd compressor buffers. For parallel LZ4 it completes
+the current frame and starts another on the next write, so data and write errors
+are available when `Flush` returns. Xz and bzip2 require `Close` to finish their
+compressed output. `Flush` does not call `File.Sync`.
+
+Command inputs (`|command args`) accept multiple arguments, whitespace, quotes,
+and escapes without starting a shell. Nonzero exits are returned as errors;
+closing early stops and reaps the direct child process.

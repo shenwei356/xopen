@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -23,6 +24,7 @@ func gzFromString(s string) string {
 	var c bytes.Buffer
 	gz := gzip.NewWriter(&c)
 	gz.Write([]byte(s))
+	gz.Close()
 	return c.String()
 }
 
@@ -43,11 +45,21 @@ func (s *XopenTest) TestIsGzip(c *C) {
 }
 
 func (s *XopenTest) TestIsStdin(c *C) {
+	previous := os.Stdin
+	devnull, err := os.Open(os.DevNull)
+	c.Assert(err, IsNil)
+	os.Stdin = devnull
+	defer func() { os.Stdin = previous; devnull.Close() }()
 	r := IsStdin()
 	c.Assert(r, Equals, false)
 }
 
 func (s *XopenTest) TestRopen(c *C) {
+	previous := os.Stdin
+	devnull, err := os.Open(os.DevNull)
+	c.Assert(err, IsNil)
+	os.Stdin = devnull
+	defer func() { os.Stdin = previous; devnull.Close() }()
 	rdr, err := Ropen("-")
 	c.Assert(err, ErrorMatches, "stdin not detected")
 	c.Assert(rdr, IsNil)
@@ -78,25 +90,32 @@ func (s *XopenTest) TestWopen(c *C) {
 	}
 }
 
-var httpTests = []struct {
-	url         string
-	expectError bool
-}{
-	{"https://raw.githubusercontent.com/brentp/xopen/master/README.md", false},
-	{"http://raw.githubusercontent.com/brentp/xopen/master/README.md", false},
-	{"http://raw.githubusercontent.com/brentp/xopen/master/BAD.md", true},
+// fixtureTransport supplies deterministic HTTP status and content without a network.
+type fixtureTransport struct{}
+
+// RoundTrip returns a fixed body or a missing-file response.
+func (fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	code, status := 200, "200 OK"
+	if req.URL.Path == "/missing" {
+		code, status = 404, "404 Not Found"
+	}
+	return &http.Response{StatusCode: code, Status: status, Body: io.NopCloser(strings.NewReader("fixture content\n")), Header: make(http.Header)}, nil
 }
 
 func (s *XopenTest) TestReadHttp(c *C) {
-	for _, t := range httpTests {
-		rdr, err := Ropen(t.url)
-		if !t.expectError {
-			c.Assert(err, IsNil)
-			v, err := rdr.ReadString(byte('\n'))
-			c.Assert(err, IsNil)
-			c.Assert(len(v), Not(Equals), 0)
+	previous := http.DefaultClient
+	http.DefaultClient = &http.Client{Transport: fixtureTransport{}}
+	defer func() { http.DefaultClient = previous }()
+	for _, url := range []string{"https://fixture.invalid/read", "http://fixture.invalid/read", "http://fixture.invalid/missing"} {
+		rdr, err := Ropen(url)
+		if strings.HasSuffix(url, "/missing") {
+			c.Assert(err, ErrorMatches, ".*404 Not Found")
 		} else {
-			c.Assert(err, ErrorMatches, ".* 404 Not Found")
+			c.Assert(err, IsNil)
+			v, err := rdr.ReadString('\n')
+			c.Assert(err, IsNil)
+			c.Assert(v, Equals, "fixture content\n")
+			c.Assert(rdr.Close(), IsNil)
 		}
 	}
 }
@@ -118,6 +137,7 @@ func (s *XopenTest) TestReadProcess(c *C) {
 			}
 		}
 		c.Assert(has, Equals, true)
+		rdr.Close()
 	}
 }
 

@@ -230,3 +230,101 @@ func TestReaderCloseAfterDecoderError(t *testing.T) {
 		t.Fatalf("err=%v decoder closed=%v source closed=%v", err, decoder.closed, source.closed)
 	}
 }
+
+// TestCompressedSourceErrors preserves a source failure after complete frame bytes.
+func TestCompressedSourceErrors(t *testing.T) {
+	want := errors.New("source failed after compressed data")
+	for _, format := range []string{"gzip", "xz", "zstd", "bzip2", "lz4"} {
+		t.Run(format, func(t *testing.T) {
+			encoded := compressInput(t, format, bytes.Repeat([]byte("payload"), 10000))
+			source := io.MultiReader(bytes.NewReader(encoded), &failingReader{err: want})
+			r, err := Buf(source)
+			if err == nil {
+				_, err = io.Copy(io.Discard, r)
+				r.Close()
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("error=%v, want %v", err, want)
+			}
+		})
+	}
+}
+
+// TestGzipHeaderTruncation covers optional fields and truncated later members.
+func TestGzipHeaderTruncation(t *testing.T) {
+	var encoded bytes.Buffer
+	w := gzip.NewWriter(&encoded)
+	w.Name = "a file name"
+	w.Comment = "comment"
+	w.Extra = []byte("0123456789")
+	if _, err := w.Write([]byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	prefix := compressInput(t, "gzip", []byte("first"))
+	for _, concat := range []bool{false, true} {
+		for n := 2; n < len(encoded.Bytes()); n++ {
+			data := bytes.Clone(encoded.Bytes()[:n])
+			if concat {
+				data = append(bytes.Clone(prefix), data...)
+			}
+			r, err := Buf(bytes.NewReader(data))
+			if err == nil {
+				_, err = io.Copy(io.Discard, r)
+				r.Close()
+			}
+			if err == nil || errors.Is(err, ErrNoContent) || errors.Is(err, io.EOF) {
+				t.Fatalf("concat=%v cut=%d: %v", concat, n, err)
+			}
+		}
+	}
+}
+
+// TestGzipErrorsDoNotExhaustPool exercises failures after the initial buffer fill.
+func TestGzipErrorsDoNotExhaustPool(t *testing.T) {
+	data := make([]byte, 300000)
+	_, _ = rand.New(rand.NewSource(1)).Read(data)
+	encoded := compressInput(t, "gzip", data)
+	encoded = encoded[:len(encoded)/2]
+	for i := 0; i < 12; i++ {
+		r, err := Buf(bytes.NewReader(encoded))
+		if err == nil {
+			_, err = io.ReadAll(r)
+			r.Close()
+		}
+		if err == nil || errors.Is(err, ErrNoContent) {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+	}
+}
+
+// TestGzipEarlyCloseReuse checks that abandoned read-ahead cannot corrupt the next reader.
+func TestGzipEarlyCloseReuse(t *testing.T) {
+	data := make([]byte, 300000)
+	_, _ = rand.New(rand.NewSource(1)).Read(data)
+	encoded := compressInput(t, "gzip", data)
+	done := make(chan error, 4)
+	for worker := 0; worker < 4; worker++ {
+		go func() {
+			for i := 0; i < 32; i++ {
+				r, err := Buf(bytes.NewReader(encoded))
+				if err != nil {
+					done <- err
+					return
+				}
+				if err = r.Close(); err != nil {
+					done <- err
+					return
+				}
+			}
+			done <- nil
+		}()
+	}
+	for worker := 0; worker < 4; worker++ {
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}
+}
