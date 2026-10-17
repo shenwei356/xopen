@@ -39,6 +39,14 @@ checkError(err)
 defer checkError(rdr.Close())
 ```
 
+`Buf` and `Ropen` return `ErrNoContent` only for an empty stream that ends
+normally. Read and decompression errors are returned by the constructor or a
+subsequent read; callers must check both. `Buf` leaves its input open if
+construction fails, while `Ropen` closes inputs it opened.
+
+Stopping early does not validate unread compressed data. Read to EOF to check
+the whole stream, then close the reader to release its resources.
+
 Writter
 
 ```go

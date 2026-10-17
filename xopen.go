@@ -131,25 +131,22 @@ type Reader struct {
 	isGzip   bool
 }
 
-// Close the associated files.
+// Close releases the decoder and input, returning the first close error.
 func (r *Reader) Close() error {
 	var err error
 	if r.gz != nil {
 		err = r.gz.Close()
-		if err != nil {
-			return err
-		}
 	}
+	// A decoder error must not prevent closing its input or recycling gzip state.
 	if c, ok := r.rdr.(io.ReadCloser); ok {
-		err = c.Close()
-		if err != nil {
-			return err
+		if closeErr := c.Close(); err == nil {
+			err = closeErr
 		}
 	}
 	if r.isGzip {
 		poolGzipReader.Put(r.gzReader)
 	}
-	return nil
+	return err
 }
 
 // Writer is returned by Wopen
@@ -235,63 +232,55 @@ var poolGzipReader = &sync.Pool{New: func() interface{} {
 	return r
 }}
 
-// Buf returns a buffered reader from an io.Reader
-// If f == "-", then it will attempt to read from os.Stdin.
-// If the file is gzipped, it will be read as such.
-func Buf(r io.Reader) (*Reader, error) {
+// Buf returns a buffered reader, detecting supported compression and removing a BOM.
+// Only a clean end of an empty stream returns ErrNoContent; read errors are preserved.
+// On failure, the caller retains ownership of r.
+func Buf(r io.Reader) (_ *Reader, err error) {
 	b := bufio.NewReaderSize(r, bufSize)
 	var rd io.Reader
-	var rdr io.ReadCloser
+	var rdr io.ReadCloser // Decoder owned by this call, separate from the input r.
 	var gzReader *gzip.Reader
 
-	isGzip := false
+	// A failed probe must release decoder resources without closing the caller's input.
+	defer func() {
+		if err != nil {
+			if rdr != nil {
+				_ = rdr.Close()
+			}
+			if gzReader != nil {
+				poolGzipReader.Put(gzReader)
+			}
+		}
+	}()
 
 	if is, err := IsGzip(b); err != nil {
-		// check BOM
-		t, _, err := b.ReadRune() // no content
-		if err != nil {
-			return nil, ErrNoContent
+		// Peek consumes its stored error. Do not probe again after a read failure.
+		// A clean EOF can still leave a valid short plain-text input in the buffer.
+		if err != io.EOF {
+			return nil, err
 		}
-		if t != '\uFEFF' {
-			b.UnreadRune()
-		}
-		return &Reader{b, r, rdr, gzReader, isGzip}, nil // non-gzip file with content less than 2 bytes
 	} else if is {
-		// rdr, err = gzip.NewReader(b)
-		rdr := poolGzipReader.Get().(*gzip.Reader)
-		err = rdr.Reset(b)
-		if err != nil {
+		gzReader = poolGzipReader.Get().(*gzip.Reader)
+		rdr = gzReader
+		if err = gzReader.Reset(b); err != nil {
 			return nil, err
 		}
 		b = bufio.NewReaderSize(rdr, bufSize)
-		gzReader = rdr
-		isGzip = true
 	} else if is, err := IsZst(b); err != nil {
-		// check BOM
-		t, _, err := b.ReadRune() // no content
-		if err != nil {
-			return nil, ErrNoContent
+		if err != io.EOF {
+			return nil, err
 		}
-		if t != '\uFEFF' {
-			b.UnreadRune()
-		}
-		return &Reader{b, r, rdr, gzReader, isGzip}, nil // non-gzip/zst file with content less than 4 bytes
 	} else if is {
-		rd, err = zstd.NewReader(b)
+		decoder, err := zstd.NewReader(b)
 		if err != nil {
 			return nil, err
 		}
-		b = bufio.NewReaderSize(rd, bufSize)
+		rdr = decoder.IOReadCloser()
+		b = bufio.NewReaderSize(rdr, bufSize)
 	} else if is, err := IsXz(b); err != nil {
-		// check BOM
-		t, _, err := b.ReadRune() // no content
-		if err != nil {
-			return nil, ErrNoContent
+		if err != io.EOF {
+			return nil, err
 		}
-		if t != '\uFEFF' {
-			b.UnreadRune()
-		}
-		return &Reader{b, r, rdr, gzReader, isGzip}, nil // non-gzip/zst/xz file with content less than 6 bytes
 	} else if is {
 		rd, err = xz.NewReader(b)
 		if err != nil {
@@ -299,47 +288,37 @@ func Buf(r io.Reader) (*Reader, error) {
 		}
 		b = bufio.NewReaderSize(rd, bufSize)
 	} else if is, err := IsBzip2(b); err != nil {
-		// check BOM
-		t, _, err := b.ReadRune() // no content
-		if err != nil {
-			return nil, ErrNoContent
+		if err != io.EOF {
+			return nil, err
 		}
-		if t != '\uFEFF' {
-			b.UnreadRune()
-		}
-		return &Reader{b, r, rdr, gzReader, isGzip}, nil // non-gzip/zst/xz file with content less than 6 bytes
 	} else if is {
-		rd, err = bzip2.NewReader(b, &bzip2.ReaderConfig{})
+		rdr, err = bzip2.NewReader(b, &bzip2.ReaderConfig{})
 		if err != nil {
 			return nil, err
 		}
-		b = bufio.NewReaderSize(rd, bufSize)
+		b = bufio.NewReaderSize(rdr, bufSize)
 	} else if is, err := IsLZ4(b); err != nil {
-		// check BOM
-		t, _, err := b.ReadRune() // no content
-		if err != nil {
-			return nil, ErrNoContent
+		if err != io.EOF {
+			return nil, err
 		}
-		if t != '\uFEFF' {
-			b.UnreadRune()
-		}
-		return &Reader{b, r, rdr, gzReader, isGzip}, nil // non-gzip/zst/xz file with content less than 6 bytes
 	} else if is {
 		rd = lz4.NewReader(b)
 		b = bufio.NewReaderSize(rd, bufSize)
 	}
 
-	// other files with content >= 6 bytes
-
-	// check BOM
+	// Probe decompressed content once, preserving failures rather than treating
+	// damaged compressed streams as empty files.
 	t, _, err := b.ReadRune()
 	if err != nil {
-		return nil, ErrNoContent
+		if err == io.EOF {
+			return nil, ErrNoContent
+		}
+		return nil, err
 	}
 	if t != '\uFEFF' {
-		b.UnreadRune()
+		_ = b.UnreadRune()
 	}
-	return &Reader{b, r, rdr, gzReader, isGzip}, nil
+	return &Reader{b, r, rdr, gzReader, gzReader != nil}, nil
 }
 
 // XReader returns a reader from a url string or a file.
@@ -406,6 +385,12 @@ func Ropen(f string) (*Reader, error) {
 		return nil, err
 	}
 	b, err := Buf(rdr)
+	if err != nil {
+		// Buf leaves its input open on failure; Ropen owns the input it opened.
+		if closer, ok := rdr.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
 	return b, err
 }
 
